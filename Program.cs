@@ -17,17 +17,36 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Hosting;
 
-// top‐level startup
-
+// compute names and flags
 var exe        = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule!.FileName);
 var ipcSock    = $"{exe}.ipc.sock";
 var debugSock  = $"{exe}.debug.sock";
 var statsSock  = $"{exe}.stats.sock";
 var inactivity = int.Parse(Environment.GetEnvironmentVariable("INACTIVITY_TIMEOUT") ?? "120000");
+var noDaemon   = args.Contains("--no-daemonize");
 
-if (ShouldBeDaemon())
+// verbose logging if foreground
+Helpers.Verbose = noDaemon;
+
+// initial info
+Console.WriteLine($"PWD: {Directory.GetCurrentDirectory()}");
+Console.WriteLine($"Sockets: {ipcSock}, {debugSock}, {statsSock}");
+Console.WriteLine($"No-daemonize: {noDaemon}");
+
+// decide mode
+var firstInstance = ShouldBeDaemon();
+Console.WriteLine($"First-instance: {firstInstance}");
+
+if (firstInstance)
 {
-    Daemonize();
+    if (noDaemon)
+        Console.WriteLine("Running in foreground");
+    else
+    {
+        Console.WriteLine("Daemonizing");
+        Daemonize();
+    }
+
     CleanupFiles();
     _ = IpcServer();
     _ = DebugServer();
@@ -37,6 +56,7 @@ if (ShouldBeDaemon())
 else
 {
     var (listen, target, stype) = ParseArgs();
+    Helpers.Log($"Client mode: send to ipc {ipcSock}");
     var cmd = new IpcMsg { source = listen, dest = target, sourceType = stype };
     var msg = JsonSerializer.Serialize(cmd, JsonContext.Default.IpcMsg);
     using var cli = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
@@ -44,8 +64,7 @@ else
     await cli.SendAsync(Encoding.UTF8.GetBytes(msg), SocketFlags.None);
 }
 
-// local functions
-
+// determine first instance by testing ipc socket
 bool ShouldBeDaemon()
 {
     if (!File.Exists(ipcSock)) return true;
@@ -62,6 +81,7 @@ bool ShouldBeDaemon()
     }
 }
 
+// fork/detach on Linux
 void Daemonize()
 {
     if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return;
@@ -76,23 +96,25 @@ void Daemonize()
 [DllImport("libc")] static extern int fork();
 [DllImport("libc")] static extern int setsid();
 
+// cleanup on exit
 void CleanupFiles()
 {
     AppDomain.CurrentDomain.ProcessExit += (_, _) =>
     {
         Console.WriteLine($"Exiting. CWD: {Directory.GetCurrentDirectory()}");
-        Console.WriteLine($"Unlinking sockets: {ipcSock}, {debugSock}, {statsSock}");
+        Console.WriteLine($"Unlinking: {ipcSock}, {debugSock}, {statsSock}");
         foreach (var f in new[] { ipcSock, debugSock, statsSock })
             try { File.Delete(f); } catch { }
     };
 }
 
+// IPC server: accept JSON commands
 async Task IpcServer()
 {
     var srv = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
     srv.Bind(new UnixDomainSocketEndPoint(ipcSock));
     srv.Listen(5);
-
+    Helpers.Log("IPC server listening");
     while (true)
     {
         var c = await srv.AcceptAsync();
@@ -109,17 +131,18 @@ async Task HandleIpc(Socket c)
     var destType = msg.sourceType.Equals("ws", StringComparison.OrdinalIgnoreCase) ? "tcp" : "ws";
     var s = new Session(msg.source, msg.dest, msg.sourceType, destType, inactivity);
     Helpers.Sessions.Add(s);
-    Helpers.Log($"new session {s.id} {s.sourceType}->{s.destType}");
+    Helpers.Log($"New session {s.id}: {s.sourceType}→{s.destType}");
     _ = s.RunProxy();
     c.Close();
 }
 
+// debug socket: stream logs
 async Task DebugServer()
 {
     var srv = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
     srv.Bind(new UnixDomainSocketEndPoint(debugSock));
     srv.Listen(5);
-
+    Helpers.Log("Debug socket listening");
     while (true)
     {
         var c = await srv.AcceptAsync();
@@ -144,35 +167,37 @@ async Task PumpLogs(Socket cli)
     }
 }
 
+// stats socket: dump sessions
 async Task StatsServer()
 {
     var srv = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
     srv.Bind(new UnixDomainSocketEndPoint(statsSock));
     srv.Listen(1);
-
+    Helpers.Log("Stats socket listening");
     while (true)
     {
         var c = await srv.AcceptAsync();
         var arr = Helpers.Sessions
-          .Select(s => new SessionStats {
-              id = s.id,
-              source = s.source,
-              dest = s.dest,
-              sourceType = s.sourceType,
-              destType = s.destType,
-              alive = s.IsAlive
-          })
-          .ToArray();
-        var js  = JsonSerializer.Serialize(arr, JsonContext.Default.SessionStatsArray);
+            .Select(s => new SessionStats {
+                id = s.id,
+                source = s.source,
+                dest = s.dest,
+                sourceType = s.sourceType,
+                destType = s.destType,
+                alive = s.IsAlive
+            })
+            .ToArray();
+        var js = JsonSerializer.Serialize(arr, JsonContext.Default.SessionStatsArray);
         await c.SendAsync(Encoding.UTF8.GetBytes(js), SocketFlags.None);
         c.Close();
     }
 }
 
+// parse client args
 (string listen, string target, string stype) ParseArgs()
 {
     string? a = null, b = null, c = "ws";
-    foreach (var arg in Environment.GetCommandLineArgs())
+    foreach (var arg in args)
     {
         if (arg.StartsWith("--unix-listen="))  a = arg.Split('=', 2)[1];
         if (arg.StartsWith("--unix-target="))  b = arg.Split('=', 2)[1];
@@ -181,19 +206,21 @@ async Task StatsServer()
     return (a!, b!, c!);
 }
 
-// helpers & DTOs
-
+// logging and sessions
 static class Helpers
 {
+    public static bool Verbose;
     public static readonly ConcurrentBag<Session> Sessions = new();
     public static readonly ConcurrentBag<string> Logs = new();
     public static void Log(string m)
     {
         var t = $"{DateTime.Now:HH:mm:ss} {m}";
         Logs.Add(t);
+        if (Verbose) Console.WriteLine(t);
     }
 }
 
+// DTOs
 class IpcMsg
 {
     public string source     { get; set; } = "";
@@ -211,6 +238,7 @@ class SessionStats
     public bool   alive      { get; set; }
 }
 
+// proxy session
 class Session
 {
     static int seq;
@@ -239,7 +267,7 @@ class Session
         }
         catch (Exception e)
         {
-            Helpers.Log($"session {id} error: {e.Message}");
+            Helpers.Log($"Session {id} error: {e.Message}");
         }
     }
 
@@ -251,7 +279,7 @@ class Session
                 .Configure(app => app.UseWebSockets()
                     .Run(async ctx =>
                     {
-                        var ws  = await ctx.WebSockets.AcceptWebSocketAsync();
+                        var ws = await ctx.WebSockets.AcceptWebSocketAsync();
                         using var tcp = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
                         tcp.Connect(new UnixDomainSocketEndPoint(dest));
                         using var ns = new NetworkStream(tcp, true);
@@ -305,15 +333,11 @@ class Session
                                    WebSocketMessageType.Binary, true, CancellationToken.None);
             }
         }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buf);
-        }
+        finally { ArrayPool<byte>.Shared.Return(buf); }
     }
 }
 
-// JSON source‐generation context for AoT
-
+// AoT‐compatible JSON source gen
 [JsonSourceGenerationOptions(WriteIndented = false)]
 [JsonSerializable(typeof(IpcMsg))]
 [JsonSerializable(typeof(SessionStats[]))]
