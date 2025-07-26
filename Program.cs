@@ -1,7 +1,6 @@
 ﻿// Program.cs
 using System;
 using System.Buffers;
-using System.Buffers.Text;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
@@ -9,15 +8,12 @@ using System.Linq;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Server.Kestrel.Core;
-using Microsoft.Extensions.Hosting;
 
 // compute names and flags
 var exe        = Path.GetFileNameWithoutExtension(Process.GetCurrentProcess().MainModule!.FileName);
@@ -51,7 +47,7 @@ if (firstInstance)
         Daemonize();
     }
 
-    // if user provided an initial session on the command line, spin it up
+    // initial session if provided on CLI
     if (!string.IsNullOrEmpty(listen) && !string.IsNullOrEmpty(target))
     {
         var destType = stype.Equals("ws", StringComparison.OrdinalIgnoreCase) ? "tcp" : "ws";
@@ -70,7 +66,7 @@ if (firstInstance)
 else
 {
     var (listen, target, stype) = ParseArgs();
-    Helpers.Log($"Client mode: send to ipc `{ipcSock}`, msg {stype}:{listen}→{target}");
+    Helpers.Log($"Client mode: send to IPC `{ipcSock}`, msg {stype}:{listen}→{target}");
     var cmd = new IpcMsg { source = listen, dest = target, sourceType = stype };
     var msg = JsonSerializer.Serialize(cmd, JsonContext.Default.IpcMsg);
 
@@ -106,11 +102,9 @@ void Daemonize()
     setsid();
     if (fork() > 0) Environment.Exit(0);
     Directory.SetCurrentDirectory("/");
-    // unlink any stray sockets
     foreach (var f in new[] { ipcSock, debugSock, statsSock })
         try { File.Delete(f); } catch { }
 }
-
 [DllImport("libc")] static extern int fork();
 [DllImport("libc")] static extern int setsid();
 
@@ -177,11 +171,9 @@ async Task DebugServer()
 
 async Task PumpLogs(Socket cli)
 {
-    // send backlog
     foreach (var l in Helpers.Logs)
         await cli.SendAsync(Encoding.UTF8.GetBytes(l + "\n"), SocketFlags.None);
 
-    // tail
     var idx = Helpers.Logs.Count;
     while (true)
     {
@@ -252,8 +244,7 @@ static class Helpers
     {
         var t = $"{DateTime.Now:HH:mm:ss} {m}";
         Logs.Add(t);
-        if (Verbose)
-            Console.WriteLine(t);
+        if (Verbose) Console.WriteLine(t);
     }
 }
 
@@ -312,41 +303,50 @@ class Session
         }
     }
 
+    // accept WebSocket on UNIX domain socket, then connect TCP (Unix socket)
     async Task RunWsToTcp()
     {
         Helpers.Log($"Session {id} – WS→TCP: listen `{source}`, connect `{dest}`");
-        var host = Host.CreateDefaultBuilder()
-            .ConfigureWebHostDefaults(web => web
-                .UseKestrel(opts => opts.ListenUnixSocket(source))
-                .Configure(app => app.UseWebSockets()
-                    .Run(async ctx =>
-                    {
-                        var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-                        Helpers.Log($"Session {id} – WS accepted, TCP connect `{dest}`");
-                        using var tcp = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-                        tcp.Connect(new UnixDomainSocketEndPoint(dest));
-                        using var ns = new NetworkStream(tcp, true);
-                        await Task.WhenAll(Pipe(ws, ns), Pipe(ns, ws));
-                    })))
-            .Build();
-
-        await host.RunAsync();
-    }
-
-    async Task RunTcpToWs()
-    {
-        Helpers.Log($"Session {id} – TCP→WS: listen `{source}`, connect `{dest}`");
+        File.Delete(source);
         var srv = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
         srv.Bind(new UnixDomainSocketEndPoint(source));
         srv.Listen(1);
 
         while (true)
         {
-            var c = await srv.AcceptAsync();
-            Helpers.Log($"Session {id} – TCP accepted, WS→`{dest}`");
-            using var ns = new NetworkStream(c, true);
-            var ws = new ClientWebSocket();
-            await ws.ConnectAsync(new Uri($"ws+unix://{dest}"), CancellationToken.None);
+            var sock = await srv.AcceptAsync();
+            Helpers.Log($"Session {id} – WS client connected for handshake");
+            var ns = new NetworkStream(sock, true);
+            var ws = await UnixWS.AcceptWebSocketAsync(ns, cancellationToken: CancellationToken.None);
+            Helpers.Log($"Session {id} – WebSocket established, TCP connect `{dest}`");
+            using var tcp = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            tcp.Connect(new UnixDomainSocketEndPoint(dest));
+            using var ts = new NetworkStream(tcp, true);
+            await Task.WhenAll(Pipe(ws, ts), Pipe(ts, ws));
+        }
+    }
+
+    // accept TCP on UNIX domain socket, then connect WebSocket (UnixWS)
+    async Task RunTcpToWs()
+    {
+        Helpers.Log($"Session {id} – TCP→WS: listen `{source}`, connect WS://{dest}");
+        File.Delete(source);
+        var srv = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        srv.Bind(new UnixDomainSocketEndPoint(source));
+        srv.Listen(1);
+
+        while (true)
+        {
+            var sock = await srv.AcceptAsync();
+            Helpers.Log($"Session {id} – TCP client connected");
+            using var ns = new NetworkStream(sock, true);
+            var ws = await UnixWS.ConnectAsync(
+                socketPath: dest,
+                host:       "localhost",
+                resource:   "/",
+                subProtocol: null,
+                cancellationToken: CancellationToken.None
+            );
             await Task.WhenAll(Pipe(ns, ws), Pipe(ws, ns));
         }
     }
@@ -370,7 +370,6 @@ class Session
     async Task Pipe(Stream stm, WebSocket ws)
     {
         var buf = ArrayPool<byte>.Shared.Rent(8192);
-
         try
         {
             Helpers.Log($"Session {id} – start TCP→WS forwarding");
@@ -384,10 +383,100 @@ class Session
             }
             Helpers.Log($"Session {id} – TCP→WS forwarding ended");
         }
-        finally
+        finally { ArrayPool<byte>.Shared.Return(buf); }
+    }
+}
+
+// helper to accept or dial WebSockets over Unix domain sockets
+public static class UnixWS
+{
+    const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+    // client handshake (unchanged)
+    public static async Task<WebSocket> ConnectAsync(
+        string socketPath,
+        string host,
+        string resource,
+        string subProtocol,
+        CancellationToken cancellationToken)
+    {
+        Helpers.Log($"UnixWS client → `{socketPath}`");
+        var ep     = new UnixDomainSocketEndPoint(socketPath);
+        var sock   = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        await sock.ConnectAsync(ep, cancellationToken);
+        var stream = new NetworkStream(sock, ownsSocket: true);
+
+        var key = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
+        var reqLines = new[]
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            $"GET {resource} HTTP/1.1",
+            $"Host: {host}",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            $"Sec-WebSocket-Key: {key}",
+            "Sec-WebSocket-Version: 13",
+            subProtocol != null ? $"Sec-WebSocket-Protocol: {subProtocol}" : null,
+            "", ""
+        };
+        var req = Encoding.ASCII.GetBytes(string.Join("\r\n", reqLines.Where(x=>x!=null)));
+        await stream.WriteAsync(req, 0, req.Length, cancellationToken);
+
+        var buf = new byte[1024];
+        var n   = await stream.ReadAsync(buf, 0, buf.Length, cancellationToken);
+        var resp = Encoding.ASCII.GetString(buf, 0, n);
+        if (!resp.Contains("101 Switching Protocols"))
+            throw new Exception("WebSocket handshake failed: " + resp);
+
+        return WebSocket.CreateFromStream(stream, isServer: false, subProtocol, TimeSpan.FromMinutes(2));
+    }
+
+    // server handshake
+    public static async Task<WebSocket> AcceptWebSocketAsync(
+        NetworkStream stream,
+        CancellationToken cancellationToken)
+    {
+        Helpers.Log("UnixWS server: awaiting handshake");
+        var hdrBuf = new byte[16 * 1024];
+        var total = 0;
+        while (true)
+        {
+            var n = await stream.ReadAsync(hdrBuf, total, hdrBuf.Length - total, cancellationToken);
+            if (n == 0) throw new Exception("Client closed during handshake");
+            total += n;
+            var txt = Encoding.ASCII.GetString(hdrBuf, 0, total);
+            if (txt.Contains("\r\n\r\n")) break;
         }
+
+        var header = Encoding.ASCII.GetString(hdrBuf, 0, total);
+        var lines  = header.Split(new[] { "\r\n" }, StringSplitOptions.None);
+        var key    = lines
+            .FirstOrDefault(l => l.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+            ?.Split(":", 2)[1].Trim();
+        if (string.IsNullOrEmpty(key))
+            throw new Exception("Missing Sec-WebSocket-Key");
+
+        var accept = ComputeAccept(key);
+        var respLines = new[]
+        {
+            "HTTP/1.1 101 Switching Protocols",
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            $"Sec-WebSocket-Accept: {accept}",
+            "",
+            ""
+        };
+        var resp = Encoding.ASCII.GetBytes(string.Join("\r\n", respLines));
+        await stream.WriteAsync(resp, 0, resp.Length, cancellationToken);
+        Helpers.Log("UnixWS server: handshake complete");
+
+        return WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, TimeSpan.FromMinutes(2));
+    }
+
+    static string ComputeAccept(string key)
+    {
+        var sha1 = SHA1.Create();
+        var buf  = sha1.ComputeHash(Encoding.ASCII.GetBytes(key + WebSocketGuid));
+        return Convert.ToBase64String(buf);
     }
 }
 
