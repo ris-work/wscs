@@ -1,4 +1,6 @@
 ﻿// Program.cs
+// NOT ONLY AI GENERATED CODE, contains manual code, Copyrights (c) RISHIKESHAN SULOCHANA/LAVAKUMAR
+// OPEN SOFTWARE LICENSE, VERSION 3.0 ONLY (no later)
 using System;
 using System.Buffers;
 using System.Collections.Concurrent;
