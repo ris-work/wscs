@@ -245,7 +245,6 @@ static (string listen, string target, string stype) ParseArgs(string[] args)
     return (a ?? string.Empty, b ?? string.Empty, ctype);
 }
 
-// Extern declarations for daemonizing on Linux
 static class NativeMethods
 {
     [DllImport("libc")]
@@ -270,23 +269,6 @@ static class Helpers
         if (Verbose)
             Console.WriteLine(entry);
     }
-}
-
-class IpcMsg
-{
-    public string source     { get; set; } = "";
-    public string dest       { get; set; } = "";
-    public string sourceType { get; set; } = "";
-}
-
-class SessionStats
-{
-    public int    id         { get; set; }
-    public string source     { get; set; } = "";
-    public string dest       { get; set; } = "";
-    public string sourceType { get; set; } = "";
-    public string destType   { get; set; } = "";
-    public bool   alive      { get; set; }
 }
 
 class Session
@@ -333,8 +315,8 @@ class Session
 
             Helpers.Log($"Session {id} – WS linked, dialing TCP `{dest}`");
             var tcp = BuildConnector(dest);
-            await tcp.ConnectAsync(BindIPEndPoint(dest), CancellationToken.None);
-            var ts = new NetworkStream(tcp, ownsSocket: true);
+            await ConnectSocketAsync(tcp, dest);
+            var ts  = new NetworkStream(tcp, ownsSocket: true);
 
             var t1 = Pipe(ws, ts);
             var t2 = Pipe(ts, ws);
@@ -373,7 +355,10 @@ class Session
             var r = await ws.ReceiveAsync(seg, CancellationToken.None);
             if (r.MessageType == WebSocketMessageType.Close) break;
             last = DateTime.Now;
-            Helpers.Log($"Session {id} pumped {r.Count} bytes WS→TCP");
+            Helpers.Log(
+                $"Session {id} pumped {r.Count} bytes WS→TCP " +
+                $"({sourceType}:{source}→{destType}:{dest})"
+            );
             await stm.WriteAsync(buf, 0, r.Count);
         }
     }
@@ -388,9 +373,16 @@ class Session
                 var n = await stm.ReadAsync(buf, 0, buf.Length);
                 if (n == 0) break;
                 last = DateTime.Now;
-                Helpers.Log($"Session {id} pumped {n} bytes TCP→WS");
-                await ws.SendAsync(new ArraySegment<byte>(buf, 0, n),
-                                   WebSocketMessageType.Binary, true, CancellationToken.None);
+                Helpers.Log(
+                    $"Session {id} pumped {n} bytes TCP→WS " +
+                    $"({sourceType}:{source}→{destType}:{dest})"
+                );
+                await ws.SendAsync(
+                    new ArraySegment<byte>(buf, 0, n),
+                    WebSocketMessageType.Binary,
+                    true,
+                    CancellationToken.None
+                );
             }
         }
         finally
@@ -399,12 +391,31 @@ class Session
         }
     }
 
+    async Task ConnectSocketAsync(Socket sock, string endpoint)
+    {
+        if (endpoint.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase))
+        {
+            var (host, port) = ParseTcp(endpoint);
+            await sock.ConnectAsync(
+                new IPEndPoint(IPAddress.Parse(host), port),
+                CancellationToken.None
+            );
+        }
+        else
+        {
+            await sock.ConnectAsync(
+                new UnixDomainSocketEndPoint(endpoint),
+                CancellationToken.None
+            );
+        }
+    }
+
     Socket BuildListener(string endpoint)
     {
         if (endpoint.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase))
         {
             var (host, port) = ParseTcp(endpoint);
-            var ip = IPAddress.Parse(host);
+            var ip   = IPAddress.Parse(host);
             var sock = new Socket(ip.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
             sock.Bind(new IPEndPoint(ip, port));
             return sock;
@@ -423,13 +434,19 @@ class Session
         if (endpoint.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase))
         {
             var (host, port) = ParseTcp(endpoint);
-            return new Socket(IPAddress.Parse(host).AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+            return new Socket(
+                IPAddress.Parse(host).AddressFamily,
+                SocketType.Stream,
+                ProtocolType.Tcp
+            );
         }
         else
         {
-            var sock = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-            sock.Connect(new UnixDomainSocketEndPoint(endpoint));
-            return sock;
+            return new Socket(
+                AddressFamily.Unix,
+                SocketType.Stream,
+                ProtocolType.Unspecified
+            );
         }
     }
 
@@ -441,9 +458,6 @@ class Session
         var port    = int.Parse(without[(idx + 1)..]);
         return (host, port);
     }
-
-    EndPoint BindIPEndPoint(string endpoint)
-        => new IPEndPoint(IPAddress.Parse(ParseTcp(endpoint).host), ParseTcp(endpoint).port);
 
     async Task<WebSocket> ConnectWebSocket(string dest)
     {
@@ -489,17 +503,26 @@ public static class UnixWS
         var header = Encoding.ASCII.GetString(hdr, 0, tot);
         var key    = header
             .Split("\r\n", StringSplitOptions.RemoveEmptyEntries)
-            .FirstOrDefault(l => l.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault(l =>
+                l.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase))
             ?.Split(":", 2)[1].Trim()
             ?? throw new Exception("Missing WS key");
 
         var accept = ComputeAccept(key);
-        var resp   = $"HTTP/1.1 101 Switching Protocols\r\n" +
-                     "Upgrade: websocket\r\n" +
-                     "Connection: Upgrade\r\n" +
-                     $"Sec-WebSocket-Accept: {accept}\r\n\r\n";
+        var resp   =
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {accept}\r\n\r\n";
+
         await stream.WriteAsync(Encoding.ASCII.GetBytes(resp), cancellationToken);
-        return WebSocket.CreateFromStream(stream, isServer: true, subProtocol: null, keepAliveInterval: TimeSpan.FromMinutes(2));
+
+        return WebSocket.CreateFromStream(
+            stream,
+            isServer: true,
+            subProtocol: null,
+            keepAliveInterval: TimeSpan.FromMinutes(2)
+        );
     }
 
     public static async Task<WebSocket> ConnectAsync(
@@ -509,9 +532,17 @@ public static class UnixWS
         string subProtocol,
         CancellationToken cancellationToken)
     {
-        var ep   = new UnixDomainSocketEndPoint(socketPath);
-        var sock = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        await sock.ConnectAsync(ep, cancellationToken);
+        var sock = new Socket(
+            AddressFamily.Unix,
+            SocketType.Stream,
+            ProtocolType.Unspecified
+        );
+
+        await sock.ConnectAsync(
+            new UnixDomainSocketEndPoint(socketPath),
+            cancellationToken
+        );
+
         var stream = new NetworkStream(sock, ownsSocket: true);
 
         var key = Convert.ToBase64String(Guid.NewGuid().ToByteArray());
@@ -538,15 +569,39 @@ public static class UnixWS
         if (!resp.Contains("101 Switching Protocols"))
             throw new Exception("WebSocket handshake failed: " + resp);
 
-        return WebSocket.CreateFromStream(stream, isServer: false, subProtocol, keepAliveInterval: TimeSpan.FromMinutes(2));
+        return WebSocket.CreateFromStream(
+            stream,
+            isServer: false,
+            subProtocol,
+            TimeSpan.FromMinutes(2)
+        );
     }
 
     static string ComputeAccept(string key)
     {
         using var sha1 = SHA1.Create();
-        var hash = sha1.ComputeHash(Encoding.ASCII.GetBytes(key + WebSocketGuid));
+        var hash = sha1.ComputeHash(
+            Encoding.ASCII.GetBytes(key + WebSocketGuid)
+        );
         return Convert.ToBase64String(hash);
     }
+}
+
+class IpcMsg
+{
+    public string source     { get; set; } = "";
+    public string dest       { get; set; } = "";
+    public string sourceType { get; set; } = "";
+}
+
+class SessionStats
+{
+    public int    id         { get; set; }
+    public string source     { get; set; } = "";
+    public string dest       { get; set; } = "";
+    public string sourceType { get; set; } = "";
+    public string destType   { get; set; } = "";
+    public bool   alive      { get; set; }
 }
 
 static class Extensions
